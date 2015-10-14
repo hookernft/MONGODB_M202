@@ -1,0 +1,237 @@
+vm box users/pass
+m202User
+m202
+
+Check production notes or any other Mongo DOC when some question
+http://docs.mongodb.org/manual/
+http://docs.mongodb.org/manual/administration/production-notes/
+
+SYSTEM SIZING AND TUNING
+http://docs.mongodb.org/manual/faq/storage/ - memory model
+mmap() is the mongo memory process in a OS level
+
+Working Set Memory
+- part of data most accessed
+  - indexes
+  - subset of data
+  
+- we need to know avg size of documents and indexes to size it
+
+Resident Memory as a metric ( memory used by mongod)
+it might be:
+- far higher than working set
+- far lower than working set
+  - this why the "journaling" process     (archivelogs - http://docs.mongodb.org/manual/core/journaling/ )
+  - while remaping from shared view to private view and/or journal, memory goes to FS(file system) cache and memory for mongod drops. however memory is still in RAM just not associated to mongod process. 
+      After remapping is done,memory will go up again
+    - It's not a problem resident memory going under working set memory as long as it's journaling !! 
+    
+Wired Tiger ( storage engine) )  (old system is mmapv1)    
+- new in mongo 3.0
+- plugabble engine
+- open source
+
+Execute:
+mongod --storageEngine wiredTiger --fork 
+-- fork to run in background
+
+It will create WiredTiger* files and collection / index files too
+Colections and index files are not saved in a database structure, just all at the same path
+
+Stores data in btrees
+Has 2 caches
+  - WT cache -> FS cache -> to disk
+    Every 60 seconds there's a checkpoint. So data will be consistent every 60 seconds. After that,it flash it to disk. Also truncate journal until that time. If WT get's dirty, it can use FS as well.
+      - Technically journaling it wouldn't be necessary if you can affort 60 seconds of data loss.
+wired tiger may document level locking
+wired tiger compression
+  - snappy ( default)) - fast
+  - zlib - morecompression
+  - none
+
+
+Process restarts,dropping caches,etc
+- mongod
+- mongos
+
+when mongo is restarted
+  - no hard page faults means data is still in memory
+    - if it's hard, data will be read from disk
+    - if it's soft, data is already in memory and just need to be reassigned ( no need to track this)
+    
+OS is rebooted -> all caches invalidated
+  - a lof of hard page faults
+To invalidate all caches without rebooting, for testing purposes(how long to start  from reboot instead mongo restart) or whatever    -- !! DO NOT DO THIS in PROD 
+  - as root: sysctl -w vm.drop_caches=1
+             sysctl -w vm.drop_caches=3 -- ALL OF THEM
+             
+             
+Storage and Disk Considerations
+- spinning disks (traditional).
+  Good for:
+  --capped collection (oplog .. replication)
+  --journal
+  -- Try to have as much memory as possible for data
+- network based storage      
+  -- NFS
+  -- EBS
+  -- VMDK ( Vmware )
+    
+- solid state disk (SSD)
+  -- pretty immature technology
+  -- way faster
+  -- variable performance       
+
+RAID 10 is suggested for MongoDB  
+
+
+MongoDB and System Level Tuning
+http://docs.mongodb.org/manual/administration/production-notes/ (NUMA)
+MongoDB and NUMA Hardware
+Mongo will show warnings about this
+Running MongoDB on a system with Non-Uniform Access Memory (NUMA) can cause a number of operational problems, including slow performance for periods of time and high system process usage.
+Not supported on MongoDB.
+Check the link for solutions
+
+Filesystems & Options
+Recommended to  use: ext4,xfs . ext3 is not recommended
+ext4
+- mount option: 
+  - noatime (/etc/fstab)
+XFS
+- investigate aligment and stripe width ( chunk size )
+
+NFS options
+does not go well with journaling. No journal in NFS ! This might complicate backup,but still.
+  If you decide to use NFS, add the following NFS options to your /etc/fstab file: bg, nolock, and noatime.
+Check productions notes anyhow
+
+SWAP
+-- allocate some swap (several gigas)
+  - This is to avoid OOM Killer Avoidance. Otherwise OS might kill mongo processes
+
+Readahead  
+This is the number of extra sectors to be read in, for any disk access
+as root: blockdev --report
+  -- check RA column
+  -- check RO column
+  ej: 256x512bytes = 128kbytes of extra +4k of page read by mongo
+    -- Usuful for oplog and capped collections (sequentially ordered)
+
+if you have SSD - set readahead to 16(min) or 32 sectors. We need to prioritize memory efficiency   
+
+Tips:
+DON'T USE HUGE PAGES
+Read production notes and read them often! 
+
+
+CPU Usage Considerations
+- user CPU
+- system CPU
+
+User CPU
+Mongo and mongod process itself
+Operations with high cost: count,distinct,sorts
+  - Clock speed is quite important, not much number of cores. 
+  Mongo use multiple cores...and it's the REGULAR APPROACH. However for specific cases for this high cost operations (distincts,count,sorts) is good to check clock speed
+
+Server side Javascript (including map reduce) increase CPU
+Intensive aggregation framework
+  - Javascript V8 permorms better
+
+System CPU
+- scanning large areas of memory
+- in-memory sorts
+Usually not a bottleneck but good for consideration
+
+
+Disk Capacity
+By default,pre allocate 64mg for the first file...goes double everytime. 64/128/256/512..../2048megabytes is the maximum. Always last 2048mb are always empty. Pre allocated
+Once you arrive to 2gb file...always create 2gb files
+That default size can be set differently too
+oplog takes 5% when replication set (can be configurable)
+
+  --oplogSize=1024
+  --smallfiles ( for 16mg pre allocate instead of 64 )
+  when using arbiter
+    - no data
+    - pre allocate for journal
+    - local db just 192mb
+      -- we need to run --nojournal ,so no 3extra gigas for journal
+      
+Reclaiming Disk Space
+- compact (more like a defragmentation)
+  withing the datafiles
+  does NOT shrink/delete existings files
+- repair (for standalone instance)            
+  you need 2x space
+  data must be good
+    -- if you have replica sets we will do RESYNC
+      1) shutdown on RS
+      2) delete all datafiles you want to RESYNC in db path
+      3) it starts and it will sync
+        -- HUGE amount of network traffic
+        
+Monitoring Strategies
+Mongodb does not track free space in disk
+MMS monitoring does not track free space
+No warning till space if gone
+  -- implement external monitoring!
+  start mongo with -- directorydb=true -> will create folders for files
+  
+Segregation of Resources
+take account :
+  memory
+  i/o benchmarking
+  connections -> file descriptors
+  
+Virtualization
+VMware provides Memory Ballooning has to be disabled for mongod
+
+Containers(zones/jails)
+Mongodb is not well tested in this
+In future might be doeable
+
+Replica Set Sizing
+in version 3.0.0: A replica set can have up to 50 members but only 7 voting members. In previous versions, replica sets can have up to 12 members.
+Normally we use 3 replica set nodes (P,S,S) although you can use P,S,Arbiter
+limits in RS (replica set)
+  - max 7 voting members
+  - max 50 members in the replica set    
+
+why Going beyond 3 nodes?
+  - hidden nodes
+    - to do analytics
+    - to do backups
+  - lesser nodes (with worst hardware/resources)
+  
+parameters for node:
+- never change votes!
+- hidden
+- priority (if it's 0 won't be primary. it goes with hidden normaly)
+- buildIndexes ( you can reduce load in lesser nodes)
+- slaveDelay (it has priority zero too. it has a delay with primary). Usuful to get databa back if you miss something
+
+Distributed Replica Sets
+A new secondary node added in a RS will ping all servers and sync from the closest one. It's  called ( replica set chaining )
+If a node is far away from Primary, might need some time to sync...consistancy will have time. It's called, "eventually consistency"     
+We can change the way the nodes sync
+rs.status() -- status of the replica set
+rs.syncFrom("hostname") -- change from whom you are synching
+Chaining can be not allowed by changing "settings" in RS conf (rs.conf()) and set chainingAllowed=false;
+
+HOMEWORK
+1.1
+(true) You begin frequently accessing your data from capped collections, in the order in which it was written.
+  You are now writing frequently, so that write locks become a constraint while reads have to wait.
+  Your working set outgrows the available memory, so you are having to go to storage much more often.
+(true) You are now using a spinning disk, rather than an SSD.
+
+1.2
+P to S1; S1 to S2; S2 to S3; S3 to S4
+1.3
+(true) Set the "allowDiskUse" parameter to true
+Switch out your HDD for an SSD so that data can be accessed more quickly
+Move your system to another machine with a faster CPU --cpu does not apply to $sort . count and distinct yes
+(true) Add an index for the variable(s) you are using to sort the documents
+(true) If you are not already doing so, include a $match earlier in the pipeline that will reduce the number of documents you are sorting
